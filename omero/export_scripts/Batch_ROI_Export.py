@@ -54,6 +54,7 @@ def get_export_data(conn, script_params, image, units=None):
 
     roi_service = conn.getRoiService()
     all_planes = script_params["Export_All_Planes"]
+    include_points = script_params.get("Include_Points_Coords", False)
     size_c = image.getSizeC()
     # Channels index
     channels = script_params.get("Channels", [1])
@@ -120,13 +121,24 @@ def get_export_data(conn, script_params, image, units=None):
                             "mean": stats[0].mean[c] if stats else "",
                             "std_dev": stats[0].stdDev[c] if stats else ""
                         }
+                        # For SPW data, add Well info...
+                        if image._obj.wellSamplesLoaded:
+                            for well_sample in image.copyWellSamples():
+                                w = well_sample.getWell()
+                                well = conn.getObject("Well", w.id.val)
+                                row_data['well_id'] = w.id.val
+                                row_data['well_row'] = well.getRow()
+                                row_data['well_column'] = well.getColumn()
+                                row_data['well_label'] = well.getWellPos()
                         add_shape_coords(shape, row_data,
-                                         pixel_size_x, pixel_size_y)
+                                         pixel_size_x, pixel_size_y,
+                                         include_points)
                         export_data.append(row_data)
 
     return export_data
 
 
+# well_id, well_row, well_column, well_label inserted if SPW
 COLUMN_NAMES = ["image_id",
                 "image_name",
                 "roi_id",
@@ -157,7 +169,8 @@ COLUMN_NAMES = ["image_id",
                 "Points"]
 
 
-def add_shape_coords(shape, row_data, pixel_size_x, pixel_size_y):
+def add_shape_coords(shape, row_data, pixel_size_x, pixel_size_y,
+                     include_points=False):
     """Add shape coordinates and length or area to the row_data dict."""
     if shape.getTextValue():
         row_data['Text'] = shape.getTextValue().getValue()
@@ -187,7 +200,8 @@ def add_shape_coords(shape, row_data, pixel_size_x, pixel_size_y):
         match = INSIGHT_POINT_LIST_RE.search(point_list)
         if match is not None:
             point_list = match.group(1)
-        row_data['Points'] = '"%s"' % point_list
+        if include_points:
+            row_data['Points'] = '"%s"' % point_list
     if isinstance(shape, PolylineI):
         coords = point_list.strip(" ").split(" ")
         try:
@@ -223,29 +237,22 @@ def add_shape_coords(shape, row_data, pixel_size_x, pixel_size_y):
         row_data['area'] = row_data['area'] * pixel_size_x * pixel_size_y
 
 
-def write_csv(conn, export_data, script_params, units_symbol):
-    """Write the list of data to a CSV file and create a file annotation."""
+def get_file_name(script_params):
     file_name = script_params.get("File_Name", "")
     if len(file_name) == 0:
         file_name = DEFAULT_FILE_NAME
     if not file_name.endswith(".csv"):
         file_name += ".csv"
+    return file_name
 
+
+def get_csv_header(units_symbol):
     csv_header = ",".join(COLUMN_NAMES)
     if units_symbol is None:
         units_symbol = "pixels"
     csv_header = csv_header.replace(",length,", ",length (%s)," % units_symbol)
     csv_header = csv_header.replace(",area,", ",area (%s)," % units_symbol)
-    csv_rows = [csv_header]
-
-    for row in export_data:
-        cells = [str(row.get(name, "")) for name in COLUMN_NAMES]
-        csv_rows.append(",".join(cells))
-
-    with open(file_name, 'w') as csv_file:
-        csv_file.write("\n".join(csv_rows))
-
-    return conn.createFileAnnfromLocalFile(file_name, mimetype="text/csv")
+    return csv_header
 
 
 def link_annotation(objects, file_ann):
@@ -269,6 +276,11 @@ def batch_roi_export(conn, script_params):
 
     dtype = script_params['Data_Type']
     ids = script_params['IDs']
+    if dtype in ("Screen", "Plate"):
+        COLUMN_NAMES.insert(1, "well_id")
+        COLUMN_NAMES.insert(2, "well_row")
+        COLUMN_NAMES.insert(3, "well_column")
+        COLUMN_NAMES.insert(4, "well_label")
     if dtype == "Image":
         images = list(conn.getObjects("Image", ids))
     elif dtype == "Dataset":
@@ -298,21 +310,29 @@ def batch_roi_export(conn, script_params):
             any_none = True
     pixel_size_x = images[0].getPixelSizeX(units=True)
     units = None if any_none else pixel_size_x.getUnit()
-    symbol = None if any_none else pixel_size_x.getSymbol()
+    units_symbol = None if any_none else pixel_size_x.getSymbol()
 
-    # build a list of dicts.
-    export_data = []
-    for image in images:
-        export_data.extend(get_export_data(conn, script_params, image, units))
+    # Create a file so we can write direct to open file
+    file_name = get_file_name(script_params)
+    csv_header = get_csv_header(units_symbol)
 
-    # Write to csv
-    file_ann = write_csv(conn, export_data, script_params, symbol)
+    row_count = 0
+    with open(file_name, 'w') as csv_file:
+        csv_file.write(csv_header + "\n")
+        for image in images:
+            for row in get_export_data(conn, script_params, image, units):
+                cells = [str(row.get(name, "")) for name in COLUMN_NAMES]
+                csv_file.write(",".join(cells) + "\n")
+                row_count += 1
+
+    file_ann = conn.createFileAnnfromLocalFile(file_name, mimetype="text/csv")
+
     if dtype == "Image":
         link_annotation(images, file_ann)
     else:
         objects = conn.getObjects(dtype, script_params['IDs'])
         link_annotation(objects, file_ann)
-    message = "Exported %s shapes" % len(export_data)
+    message = "Exported %s shapes" % row_count
     return file_ann, message
 
 
@@ -345,8 +365,16 @@ def run_script():
                          "where Z and T are not set?"),
             default=False),
 
+        scripts.Bool(
+            "Include_Points_Coords", grouping="5",
+            description=("Export the Points string for Polygons "
+                         "and Polylines. Disable this to reduce the "
+                         "size of the csv file when exporting large "
+                         "numbers of ROIs"),
+            default=True),
+
         scripts.String(
-            "File_Name", grouping="5", default=DEFAULT_FILE_NAME,
+            "File_Name", grouping="6", default=DEFAULT_FILE_NAME,
             description="Name of the exported CSV file"),
 
         authors=["William Moore", "OME Team"],
